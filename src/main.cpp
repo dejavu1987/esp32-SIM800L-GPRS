@@ -1,5 +1,5 @@
 #include <Arduino.h>
-
+#include <SIM800L.h>
 // Define a generic type for serial objects
 typedef HardwareSerial *SerialObject;
 
@@ -11,136 +11,147 @@ char *read_serial_command(SerialObject serial);
 char serial_buffer[128];
 int  serial_buffer_index = 0;
 
+const char APN[] = "pinternet.interkom.de";
+const char URL[] = "http://postman-echo.com/get?foo1=bar1&foo2=bar2";
+
 // Define the pins used for hardware serial communication with the SIM800L
 // module
-#define RX_PIN 4
-#define TX_PIN 5
+// c3
+#define RX_PIN 2
+#define TX_PIN 1
+#define SIM800_RST_PIN 3
+// s3
+// #define RX_PIN 4
+// #define TX_PIN 5
 
 // Create a HardwareSerial object
-HardwareSerial sim800l(1);
+HardwareSerial serial1(1);
+
+SIM800L *sim800l;
 
 // Define the button pin and debounce variables
 const int     buttonPin = 0;
 unsigned long lastDebounceTime = 0;
 const int     debounceDelay = 50; // Debounce delay in milliseconds
 
+void setupModule();
+
 void setup() {
   // Initialize serial communication
   Serial.begin(115200);
-  sim800l.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
-  delay(2000);
+  serial1.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+  delay(1000);
+  sim800l = new SIM800L((Stream *)&serial1, SIM800_RST_PIN, 200, 512,
+                        (Stream *)&Serial);
   Serial.println("Hello");
 
-  // Send AT commands to initialize the SIM800L module
-  send_at_command("AT");
-  send_at_command("AT+CGATT=1");
-  send_at_command("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"");
-  send_at_command("AT+SAPBR=3,1,\"APN\",\"pinternet.interkom.de\"");
-  delay(2000);
-  send_at_command("AT+SAPBR=1,1");
-  send_at_command("AT+SAPBR=2,1"); // Test IP
-  send_at_command("AT+CSQ");       // Test Signal quality
-  // +CSQ: 17 <Strength: -113 ~ 31dBm>, 0 <BitError 0 ~ 255>
-
-  // send_at_command("AT+COPS=?"); // list all available networks
-
+  setupModule();
   // Set button pin as input with internal pull-up resistor
   pinMode(buttonPin, INPUT_PULLUP);
 }
 
 void make_request() {
   Serial.println("POST");
-  // Send the POST request
-  send_post_request_at();
-  delay(6000);
-  send_at_command("AT+HTTPREAD"); // Read data
-  while (sim800l.available()) {
-    Serial.write(sim800l.read());
-  }
-  // send_at_command("AT+HTTPTERM"); //Terminate http connection
-  // send_at_command("AT+SAPBR=0,1"); //Terminate gprs connection
+  // do sth
   Serial.println("DONE");
 }
 
 void loop() {
-  // Read the button state
-  int buttonState = digitalRead(buttonPin);
-
-  // Debounce the button press
-  if (buttonState == LOW && (millis() - lastDebounceTime) > debounceDelay) {
-    lastDebounceTime = millis();
-
-    // Make the request
-    make_request();
-  }
-  // Read the received command from serial
-  char *command = read_serial_command((SerialObject)&Serial);
-
-  // If a command is available, send it as an AT command
-  if (command != NULL) {
-    send_at_command(command);
+  // Establish GPRS connectivity (5 trials)
+  bool connected = false;
+  for (uint8_t i = 0; i < 5 && !connected; i++) {
+    delay(1000);
+    connected = sim800l->connectGPRS();
   }
 
-  // Read the received command from sim800l
-  command = read_serial_command(&sim800l);
-
-  // If a command is available, process it
-  if (command != NULL) {
-    // Process the received command from sim800l
-    Serial.println(command);
+  // Check if connected, if not reset the module and setup the config again
+  if (connected) {
+    Serial.print(F("GPRS connected with IP "));
+    Serial.println(sim800l->getIP());
+  } else {
+    Serial.println(F("GPRS not connected !"));
+    Serial.println(F("Reset the module."));
+    sim800l->reset();
+    setupModule();
+    return;
   }
+
+  Serial.println(F("Start HTTP GET..."));
+
+  // Do HTTP GET communication with 10s for the timeout (read)
+  uint16_t rc = sim800l->doGet(URL, 10000);
+  if (rc == 200) {
+    // Success, output the data received on the serial
+    Serial.print(F("HTTP GET successful ("));
+    Serial.print(sim800l->getDataSizeReceived());
+    Serial.println(F(" bytes)"));
+    Serial.print(F("Received : "));
+    Serial.println(sim800l->getDataReceived());
+  } else {
+    // Failed...
+    Serial.print(F("HTTP GET error "));
+    Serial.println(rc);
+  }
+
+  // Close GPRS connectivity (5 trials)
+  bool disconnected = sim800l->disconnectGPRS();
+  for (uint8_t i = 0; i < 5 && !connected; i++) {
+    delay(1000);
+    disconnected = sim800l->disconnectGPRS();
+  }
+
+  if (disconnected) {
+    Serial.println(F("GPRS disconnected !"));
+  } else {
+    Serial.println(F("GPRS still connected !"));
+  }
+
+  // Go into low power mode
+  bool lowPowerMode = sim800l->setPowerMode(MINIMUM);
+  if (lowPowerMode) {
+    Serial.println(F("Module in low power mode"));
+  } else {
+    Serial.println(F("Failed to switch module to low power mode"));
+  }
+
+  // End of program... wait...
+  while (1)
+    ;
 }
 
-void send_at_command(const char *command) {
-  sim800l.println(command);
-  delay(2000);
-  while (sim800l.available()) {
-    Serial.write(sim800l.read());
+void setupModule() {
+  // Wait until the module is ready to accept AT commands
+  while (!sim800l->isReady()) {
+    Serial.println(F("Problem to initialize AT command, retry in 1 sec"));
+    delay(1000);
   }
-}
+  Serial.println(F("Setup Complete!"));
 
-void send_post_request_at() {
-  // Build the HTTP POST request string
-  delay(2000);
-
-  send_at_command("AT+HTTPINIT"); // Start http
-
-  // AT+HTTPPARA="CID",1
-  send_at_command("AT+HTTPPARA=\"CID\",1"); // Set connection type
-
-  // send_at_command("AT+HTTPSSL=1"); // Uncomment this if your URL is https
-
-  // AT+HTTPPARA="URL","http://sandro.awardspace.info/php/hola.php?hello_world"
-  send_at_command("AT+HTTPPARA=\"URL\",\"https://catfact.ninja/fact\"");
-  // send_at_command("AT+HTTPPARA=\"CONTENT\",\"application/json\"");
-  // send_at_command("AT+HTTPDATA=1500,5000\r\n");
-  // send_at_command("{ \"body\": { \"result\": \"true\" } }");
-  delay(2000);
-  send_at_command("AT+HTTPACTION=0");
-}
-
-// Function to read serial data and return the received command
-char *read_serial_command(SerialObject serial) {
-  // Check for incoming serial data
-  if (serial->available()) {
-    char c = serial->read();
-
-    // Store the received character in the buffer
-    serial_buffer[serial_buffer_index++] = c;
-
-    // Check if the end of the command is reached
-    if (c == '\n' || c == '\r') {
-      // Terminate the string
-      serial_buffer[serial_buffer_index] = '\0';
-
-      // Reset the buffer index
-      serial_buffer_index = 0;
-
-      // Return the received command
-      return serial_buffer;
-    }
+  // Wait for the GSM signal
+  uint8_t signal = sim800l->getSignal();
+  while (signal <= 0) {
+    delay(1000);
+    signal = sim800l->getSignal();
   }
+  Serial.print(F("Signal OK (strenght: "));
+  Serial.print(signal);
+  Serial.println(F(")"));
+  delay(1000);
 
-  // Return NULL if no command is available
-  return NULL;
+  // Wait for operator network registration (national or roaming network)
+  NetworkRegistration network = sim800l->getRegistrationStatus();
+  while (network != REGISTERED_HOME && network != REGISTERED_ROAMING) {
+    delay(1000);
+    network = sim800l->getRegistrationStatus();
+  }
+  Serial.println(F("Network registration OK"));
+  delay(1000);
+
+  // Setup APN for GPRS configuration
+  bool success = sim800l->setupGPRS(APN);
+  while (!success) {
+    success = sim800l->setupGPRS(APN);
+    delay(5000);
+  }
+  Serial.println(F("GPRS config OK"));
 }
